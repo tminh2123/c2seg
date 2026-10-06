@@ -1,0 +1,52 @@
+project:
+  name: c2seg
+  seed: 42
+
+data:
+  train_dir: ../../dataset/QaTa-COV19/QaTa-COV19-v2/c2seg/train
+  val_dir:   ../../dataset/QaTa-COV19/QaTa-COV19-v2/c2seg/val
+  test_dir:  ../../dataset/QaTa-COV19/QaTa-COV19-v2/c2seg/test
+  image_size: 224
+  num_workers: 4
+
+model:
+  in_channels: 3
+  num_classes: 1
+  clip_model: "openai/clip-vit-base-patch32"
+  d_t: 512
+
+# Stage I - CaCL pretraining
+pretrain:
+  epochs: 
+  batch_size: 256         # paper uses 256, reduce if OOM
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  temperature: 0.07       # tau
+  eps: 0.8                # soft-label mixing weight (rho)
+  checkpoint: checkpoints/c2seg_pretrain.pth
+
+# Stage II - segmentation fine-tuning
+train:
+  epochs: 100
+  batch_size: 32
+  lr: 1.0e-3              # QaTa-COV19 / CVC-ClinicDB
+  lr_slow: 3.0e-4         # MosMedData+ / Kvasir
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  bce_weight: 0.5
+
+optimizer:
+  name: adam
+
+scheduler:
+  name: cosine
+
+eval:
+  batch_size: 32
+  threshold: 0.5
+  checkpoint: checkpoints/c2seg_best.pth
+
+logging:
+  log_dir: logs/
+  checkpoint_dir: checkpoints/
+  save_every: 10
