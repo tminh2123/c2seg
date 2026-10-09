@@ -17,7 +17,7 @@ model:
 
 # Stage I - CaCL pretraining
 pretrain:
-  epochs: 
+  epochs: 50
   batch_size: 256         # paper uses 256, reduce if OOM
   lr: 3.0e-4
   weight_decay: 1.0e-4
@@ -28,9 +28,9 @@ pretrain:
 # Stage II - segmentation fine-tuning
 train:
   epochs: 100
-  batch_size: 32
-  lr: 1.0e-3              # QaTa-COV19 / CVC-ClinicDB
-  lr_slow: 3.0e-4         # MosMedData+ / Kvasir
+  batch_size: 16
+  lr: 1.0e-3              # Paper: 1e-3 for QaTa-COV19 / CVC-ClinicDB
+  lr_slow: 3.0e-4         # Paper: 3e-4 for MosMedData+ / Kvasir
   weight_decay: 1.0e-4
   grad_clip: 1.0
   bce_weight: 0.5

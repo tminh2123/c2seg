@@ -2,13 +2,13 @@
 Training script for C2Seg.
 Usage:
   # Stage I - CaCL pretraining
-  python train_c2seg.py --stage pretrain --config configs/c2seg.yaml
+  python run.py --stage pretrain --config configs/config.yaml
 
   # Stage II - segmentation fine-tuning
-  python train_c2seg.py --stage train --config configs/c2seg.yaml
+  python run.py --stage train --config configs/config.yaml
 
   # Evaluation
-  python train_c2seg.py --stage eval --config configs/c2seg.yaml
+  python run.py --stage eval --config configs/config.yaml
 """
 
 import argparse
@@ -25,7 +25,7 @@ from utils.metrics import AverageMeter
 from utils.seg_metrics import dice_score, miou_score, hd95, assd
 from models.c2seg import C2Seg
 from models.losses import CaCLLoss, BCEDiceLoss
-from datasets.c2seg_dataset import C2SegDataset
+from datasets.dataset import C2SegDataset
 
 
 # ---------------------------------------------------------------------------
@@ -261,14 +261,61 @@ def eval_mode(cfg):
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--stage',  required=True, choices=['pretrain', 'train', 'eval'])
-    p.add_argument('--config', default='configs/c2seg.yaml')
+    p.add_argument('--config', default='configs/config.yaml')
     p.add_argument('--pretrained', default=None, help='Path to pretrained ckpt for stage II')
+    p.add_argument('--no-text', action='store_true', help='Disable text fusion (ablation study)')
+    p.add_argument('--no-bcam', action='store_true', help='Disable BCAM (ablation study)')
+    p.add_argument('--no-kgate', action='store_true', help='Disable K-Gate (ablation study)')
+    p.add_argument('--epochs', type=int, default=None, help='Override number of epochs')
+    p.add_argument('--lr', type=float, default=None, help='Override learning rate')
+    p.add_argument('--image-size', type=int, default=None, help='Override image size')
+    p.add_argument('--batch-size', type=int, default=None, help='Override batch size')
+    p.add_argument('--tag', type=str, default=None, help='Experiment tag for checkpoint naming (e.g., "v1", "simple_kan")')
     return p.parse_args()
 
 
 if __name__ == '__main__':
     args = parse_args()
     cfg  = load_config(args.config)
+    
+    # Add ablation flags to model config
+    cfg['model']['use_text'] = not getattr(args, 'no_text', False)
+    cfg['model']['use_bcam'] = not getattr(args, 'no_bcam', False)
+    cfg['model']['use_kgate'] = not getattr(args, 'no_kgate', False)
+    
+    # Override config with command line args
+    if args.epochs:
+        cfg['train']['epochs'] = args.epochs
+        cfg['pretrain']['epochs'] = args.epochs
+    if args.lr:
+        cfg['train']['lr'] = args.lr
+        cfg['pretrain']['lr'] = args.lr
+    if args.image_size:
+        cfg['data']['image_size'] = args.image_size
+    if args.batch_size:
+        cfg['train']['batch_size'] = args.batch_size
+        cfg['pretrain']['batch_size'] = args.batch_size
+    
+    # Apply experiment tag to checkpoint and log paths
+    if args.tag:
+        tag = args.tag
+        cfg['logging']['checkpoint_dir'] = f"checkpoints/{tag}"
+        cfg['logging']['log_dir'] = f"logs/{tag}"
+        cfg['pretrain']['checkpoint'] = f"checkpoints/{tag}/c2seg_pretrain.pth"
+        cfg['eval']['checkpoint'] = f"checkpoints/{tag}/c2seg_best.pth"
+        print(f"Experiment tag: {tag}")
+        print(f"Checkpoints: checkpoints/{tag}/")
+        print(f"Logs: logs/{tag}/")
+    
+    # Log settings
+    stage = args.stage
+    if stage == 'pretrain':
+        print(f"Pretrain: epochs={cfg['pretrain']['epochs']}, batch_size={cfg['pretrain']['batch_size']}, lr={cfg['pretrain']['lr']}")
+    elif stage == 'train':
+        print(f"Ablation: use_text={cfg['model']['use_text']}, use_bcam={cfg['model']['use_bcam']}, use_kgate={cfg['model']['use_kgate']}")
+        print(f"Training: epochs={cfg['train']['epochs']}, lr={cfg['train']['lr']}, image_size={cfg['data']['image_size']}")
+    elif stage == 'eval':
+        print(f"Evaluation: checkpoint={cfg['eval']['checkpoint']}, image_size={cfg['data']['image_size']}")
 
     if args.stage == 'pretrain':
         pretrain(cfg)
