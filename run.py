@@ -271,6 +271,7 @@ def parse_args():
     p.add_argument('--image-size', type=int, default=None, help='Override image size')
     p.add_argument('--batch-size', type=int, default=None, help='Override batch size')
     p.add_argument('--tag', type=str, default=None, help='Experiment tag for checkpoint naming (e.g., "v1", "simple_kan")')
+    p.add_argument('--channel-scale', type=float, default=1.0, help='Channel width scale (0.5=half, 0.25=quarter)')
     return p.parse_args()
 
 
@@ -282,6 +283,9 @@ if __name__ == '__main__':
     cfg['model']['use_text'] = not getattr(args, 'no_text', False)
     cfg['model']['use_bcam'] = not getattr(args, 'no_bcam', False)
     cfg['model']['use_kgate'] = not getattr(args, 'no_kgate', False)
+    
+    # Apply channel scaling
+    cfg['model']['channel_scale'] = getattr(args, 'channel_scale', 1.0)
     
     # Override config with command line args
     if args.epochs:
@@ -309,6 +313,11 @@ if __name__ == '__main__':
     
     # Log settings
     stage = args.stage
+    channel_scale = cfg['model']['channel_scale']
+    base_channels = [64, 128, 256, 512, 512]
+    scaled_channels = [max(16, int(c * channel_scale)) for c in base_channels]
+    print(f"Channel scale: {channel_scale} -> {scaled_channels}")
+    
     if stage == 'pretrain':
         print(f"Pretrain: epochs={cfg['pretrain']['epochs']}, batch_size={cfg['pretrain']['batch_size']}, lr={cfg['pretrain']['lr']}")
     elif stage == 'train':
