@@ -266,6 +266,7 @@ def parse_args():
     p.add_argument('--no-text', action='store_true', help='Disable text fusion (ablation study)')
     p.add_argument('--no-bcam', action='store_true', help='Disable BCAM (ablation study)')
     p.add_argument('--no-kgate', action='store_true', help='Disable K-Gate (ablation study)')
+    p.add_argument('--no-kan', action='store_true', help='Use MLP instead of KAN (ablation study)')
     p.add_argument('--epochs', type=int, default=None, help='Override number of epochs')
     p.add_argument('--lr', type=float, default=None, help='Override learning rate')
     p.add_argument('--image-size', type=int, default=None, help='Override image size')
@@ -283,6 +284,7 @@ if __name__ == '__main__':
     cfg['model']['use_text'] = not getattr(args, 'no_text', False)
     cfg['model']['use_bcam'] = not getattr(args, 'no_bcam', False)
     cfg['model']['use_kgate'] = not getattr(args, 'no_kgate', False)
+    cfg['model']['use_kan'] = not getattr(args, 'no_kan', False)
     
     # Apply channel scaling
     cfg['model']['channel_scale'] = getattr(args, 'channel_scale', 1.0)

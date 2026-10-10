@@ -48,6 +48,34 @@ class KANLayer(nn.Module):
         return self.kan(x)
 
 
+class MLPLayer(nn.Module):
+    """
+    MLP replacement for KANLayer - for ablation study.
+    Same interface as KANLayer but uses Linear layers.
+    """
+    def __init__(self, in_dim: int, out_dim: int, grid_size: int = 5, spline_order: int = 3):
+        # grid_size and spline_order ignored, kept for API compatibility
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, out_dim),
+            nn.SiLU(),
+            nn.Linear(out_dim, out_dim),
+        )
+
+    def forward(self, x):
+        # Handle 3D input [B, N, C]
+        if x.dim() == 3:
+            B, N, C = x.shape
+            x = x.reshape(B * N, C)
+            x = self.mlp(x)
+            x = x.reshape(B, N, self.out_dim)
+            return x
+        # 2D input [batch, features]
+        return self.mlp(x)
+
+
 # ---------------------------------------------------------------------------
 # Visual Encoder: 3 Conv blocks + 2 KAN layers, returns multi-scale features
 # ---------------------------------------------------------------------------
@@ -71,7 +99,7 @@ class VisualEncoder(nn.Module):
     """
     Produces 5 multi-scale feature maps V1..V5 (progressively downsampled).
     Default channels: 64 -> 128 -> 256 -> 512 -> 512
-    First 3 stages are CNN, last 2 are KAN (as per paper Figure 2).
+    First 3 stages are CNN, last 2 are KAN/MLP (as per paper Figure 2).
     """
     def __init__(
         self, 
@@ -79,10 +107,15 @@ class VisualEncoder(nn.Module):
         kan_grid_size: int = 5, 
         kan_spline_order: int = 3,
         channels: list = None,  # Custom channel dims [c1, c2, c3, c4, c5]
+        use_kan: bool = True,   # False to use MLP instead
     ):
         super().__init__()
         self.kan_grid_size = kan_grid_size
         self.kan_spline_order = kan_spline_order
+        self.use_kan = use_kan
+        
+        # Select layer type
+        Layer = KANLayer if use_kan else MLPLayer
         
         # Default or custom channels
         if channels is None:
@@ -95,41 +128,40 @@ class VisualEncoder(nn.Module):
         self.enc3 = ConvBlock(c2, c3)            # H/4 x W/4
         self.pool = nn.MaxPool2d(2)
 
-        # 2 KAN stages (operate channel-wise via 1x1-style reshape)
-        self.kan4 = self._make_kan_stage(c3, c4)  # H/8 x W/8
-        self.kan5 = self._make_kan_stage(c4, c5)  # H/16 x W/16
+        # 2 KAN/MLP stages (operate channel-wise via 1x1-style reshape)
+        self.stage4 = self._make_stage(c3, c4, Layer)  # H/8 x W/8
+        self.stage5 = self._make_stage(c4, c5, Layer)  # H/16 x W/16
         
         self.out_channels = c5  # For global vector dim
 
-    def _make_kan_stage(self, in_ch, out_ch):
+    def _make_stage(self, in_ch, out_ch, Layer):
         return nn.Sequential(
             nn.MaxPool2d(2),
-            # channel-mix via KAN (reshape to apply over channels)
-            _SpatialKAN(in_ch, out_ch, self.kan_grid_size, self.kan_spline_order),
+            _SpatialLayer(in_ch, out_ch, self.kan_grid_size, self.kan_spline_order, Layer),
         )
 
     def forward(self, x):
         v1 = self.enc1(x)                  # [B, c1, H,   W]
         v2 = self.enc2(self.pool(v1))      # [B, c2, H/2, W/2]
         v3 = self.enc3(self.pool(v2))      # [B, c3, H/4, W/4]
-        v4 = self.kan4(v3)                 # [B, c4, H/8, W/8]
-        v5 = self.kan5(v4)                 # [B, c5, H/16,W/16]
+        v4 = self.stage4(v3)               # [B, c4, H/8, W/8]
+        v5 = self.stage5(v4)               # [B, c5, H/16,W/16]
 
         # global image vector
         v_global = F.adaptive_avg_pool2d(v5, 1).flatten(1)  # [B, c5]
         return [v1, v2, v3, v4, v5], v_global
 
 
-class _SpatialKAN(nn.Module):
-    """Apply KAN across channels at each spatial location."""
-    def __init__(self, in_ch, out_ch, grid_size: int = 5, spline_order: int = 3):
+class _SpatialLayer(nn.Module):
+    """Apply KAN/MLP across channels at each spatial location."""
+    def __init__(self, in_ch, out_ch, grid_size: int = 5, spline_order: int = 3, Layer=KANLayer):
         super().__init__()
-        self.kan = KANLayer(in_ch, out_ch, grid_size, spline_order)
+        self.layer = Layer(in_ch, out_ch, grid_size, spline_order)
 
     def forward(self, x):
         B, C, H, W = x.shape
         x = x.permute(0, 2, 3, 1).reshape(-1, C)   # [B*H*W, C]
-        x = self.kan(x)
+        x = self.layer(x)
         x = x.reshape(B, H, W, -1).permute(0, 3, 1, 2)
         return x
 
@@ -175,13 +207,14 @@ class LangProjection(nn.Module):
 # BCAM: Bidirectional Complementary Attention Module
 # ---------------------------------------------------------------------------
 class BCAM(nn.Module):
-    def __init__(self, vis_ch: int, lang_ch: int, grid_size: int = 5, spline_order: int = 3):
+    def __init__(self, vis_ch: int, lang_ch: int, grid_size: int = 5, spline_order: int = 3, use_kan: bool = True):
         super().__init__()
         d = vis_ch
-        self.v_key   = KANLayer(vis_ch,  d, grid_size, spline_order)
-        self.v_value = KANLayer(vis_ch,  d, grid_size, spline_order)
-        self.l_key   = KANLayer(lang_ch, d, grid_size, spline_order)
-        self.l_value = KANLayer(lang_ch, d, grid_size, spline_order)
+        Layer = KANLayer if use_kan else MLPLayer
+        self.v_key   = Layer(vis_ch,  d, grid_size, spline_order)
+        self.v_value = Layer(vis_ch,  d, grid_size, spline_order)
+        self.l_key   = Layer(lang_ch, d, grid_size, spline_order)
+        self.l_value = Layer(lang_ch, d, grid_size, spline_order)
         self.scale   = d ** -0.5
 
     def forward(self, V, L_w):
@@ -250,32 +283,32 @@ class BCAM(nn.Module):
 # ---------------------------------------------------------------------------
 class KGate(nn.Module):
     """
-    KAN-based Attention Gating (Section 3.4, Eq. 7)
+    KAN/MLP-based Attention Gating (Section 3.4, Eq. 7)
     
-    Each path: KAN → ReLU → KAN → Tanh
+    Each path: Layer → ReLU → Layer → Tanh
     
-    g_v = tanh(KAN(ReLU(KAN(F_v))))
-    g_l = tanh(KAN(ReLU(KAN(F_l))))
+    g_v = tanh(Layer(ReLU(Layer(F_v))))
+    g_l = tanh(Layer(ReLU(Layer(F_l))))
     F_v^g = F_v ⊙ g_v,  F_l^g = F_l ⊙ g_l
     F_out = Conv1x1([F_v^g || F_l^g])
     """
-    def __init__(self, ch: int, grid_size: int = 5, spline_order: int = 3):
+    def __init__(self, ch: int, grid_size: int = 5, spline_order: int = 3, use_kan: bool = True):
         super().__init__()
+        Layer = KANLayer if use_kan else MLPLayer
+        
         # LayerNorm for stability
         self.norm_v = nn.LayerNorm(ch)
         self.norm_l = nn.LayerNorm(ch)
         
-        # KAN-based gating: KAN → ReLU → KAN → Tanh (as per paper Figure 2)
+        # Gating: Layer → ReLU → Layer → Tanh (as per paper Figure 2)
         self.gate_v = nn.Sequential(
-            KANLayer(ch, ch, grid_size, spline_order),
+            Layer(ch, ch, grid_size, spline_order),
             nn.ReLU(),
-            KANLayer(ch, ch, grid_size, spline_order),
+            Layer(ch, ch, grid_size, spline_order),
             nn.Tanh()
         )
         self.gate_l = nn.Sequential(
-            KANLayer(ch, ch, grid_size, spline_order),
-            nn.ReLU(),
-            KANLayer(ch, ch, grid_size, spline_order),
+            Layer(ch, ch, grid_size, spline_order),
             nn.Tanh()
         )
         
@@ -353,6 +386,7 @@ class C2Seg(nn.Module):
         use_text: bool   = True,  # Set False to disable BCAM/K-Gate (ablation)
         use_bcam: bool   = True,  # Set False to skip BCAM (ablation)
         use_kgate: bool  = True,  # Set False to skip K-Gate (ablation)
+        use_kan: bool    = True,  # Set False to use MLP instead of KAN (ablation)
         kan_grid_size: int = 5,   # U-KAN default
         kan_spline_order: int = 3,  # U-KAN default (cubic spline)
         channel_scale: float = 1.0,  # Scale factor for channels (0.5 = half, 0.25 = quarter)
@@ -361,6 +395,7 @@ class C2Seg(nn.Module):
         self.use_text = use_text
         self.use_bcam = use_bcam
         self.use_kgate = use_kgate
+        self.use_kan = use_kan
         
         # Scale channels (KAN can use narrower networks)
         base_channels = [64, 128, 256, 512, 512]
@@ -369,7 +404,8 @@ class C2Seg(nn.Module):
         
         self.visual_enc = VisualEncoder(
             in_channels, kan_grid_size, kan_spline_order, 
-            channels=self.VIS_CHANNELS
+            channels=self.VIS_CHANNELS,
+            use_kan=use_kan,
         )
         
         if use_text:
@@ -380,13 +416,13 @@ class C2Seg(nn.Module):
             # BCAM at 4 scales (v2, v3, v4, v5 - skip v1) as per paper Figure 2
             if use_bcam:
                 self.bcam = nn.ModuleList([
-                    BCAM(c, c, kan_grid_size, kan_spline_order) for c in self.BCAM_CHANNELS
+                    BCAM(c, c, kan_grid_size, kan_spline_order, use_kan=use_kan) for c in self.BCAM_CHANNELS
                 ])
             
             # K-Gate at 4 scales (same as BCAM)
             if use_kgate:
                 self.kgate = nn.ModuleList([
-                    KGate(c, kan_grid_size, kan_spline_order) for c in self.BCAM_CHANNELS
+                    KGate(c, kan_grid_size, kan_spline_order, use_kan=use_kan) for c in self.BCAM_CHANNELS
                 ])
             
             # Simple fusion layer when not using K-Gate
