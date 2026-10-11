@@ -154,11 +154,19 @@ def train(cfg, pretrained_ckpt: str = None):
     criterion = BCEDiceLoss(bce_weight=tcfg['bce_weight'])
 
     # visual encoder uses smaller lr (fine-tune), rest uses full lr
-    visual_params  = list(model.visual_enc.parameters())
-    other_params   = [p for n, p in model.named_parameters()
-                      if not n.startswith('visual_enc') and
-                         not n.startswith('lang_enc') and
-                         p.requires_grad]
+    # Visual encoder includes: down0-down4, pool
+    visual_encoder_prefixes = ('down0', 'down1', 'down2', 'down3', 'down4', 'pool')
+    visual_params = []
+    other_params = []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if n.startswith('lang_enc'):
+            continue  # frozen, skip
+        if any(n.startswith(prefix) for prefix in visual_encoder_prefixes):
+            visual_params.append(p)
+        else:
+            other_params.append(p)
     optimizer = torch.optim.Adam([
         {'params': visual_params, 'lr': tcfg['lr'] * 0.1},   # small lr for visual encoder
         {'params': other_params,  'lr': tcfg['lr']},
@@ -286,8 +294,18 @@ if __name__ == '__main__':
     cfg['model']['use_kgate'] = not getattr(args, 'no_kgate', False)
     cfg['model']['use_kan'] = not getattr(args, 'no_kan', False)
     
-    # Apply channel scaling
-    cfg['model']['channel_scale'] = getattr(args, 'channel_scale', 1.0)
+    # Apply channel scaling (use base_channel instead)
+    base_channel = 64
+    scale = getattr(args, 'channel_scale', 1.0)
+    cfg['model']['base_channel'] = base_channel
+    cfg['model']['channel_scale'] = scale
+    
+    # Pass image size to model
+    cfg['model']['img_size'] = cfg['data']['image_size']
+    
+    # Pass other config params
+    cfg['model']['max_token_len'] = cfg['model'].get('max_token_len', 18)
+    cfg['model']['dropout'] = cfg['model'].get('dropout', 0.5)
     
     # Override config with command line args
     if args.epochs:

@@ -60,22 +60,28 @@ class CaCLLoss(nn.Module):
 
 
 class BCEDiceLoss(nn.Module):
-    """Combined BCE + Dice loss for binary segmentation."""
+    """Combined BCE + Dice loss for binary segmentation.
+    
+    Expects input to be probabilities (after sigmoid), NOT logits.
+    """
 
     def __init__(self, bce_weight: float = 0.5):
         super().__init__()
         self.bce_w = bce_weight
-        self.bce   = nn.BCEWithLogitsLoss()
+        # Use BCELoss since model output already has sigmoid
+        self.bce = nn.BCELoss()
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor):
+    def forward(self, probs: torch.Tensor, targets: torch.Tensor):
         """
-        logits:  [B, 1, H, W]  raw network output
+        probs:   [B, 1, H, W]  probability output (after sigmoid in model)
         targets: [B, 1, H, W]  binary mask float
         """
-        bce_loss = self.bce(logits, targets)
+        # Clamp to avoid log(0)
+        probs = probs.clamp(1e-7, 1 - 1e-7)
+        
+        bce_loss = self.bce(probs, targets)
 
-        prob = torch.sigmoid(logits)
-        flat_p = prob.flatten(1)
+        flat_p = probs.flatten(1)
         flat_t = targets.flatten(1)
         intersection = (flat_p * flat_t).sum(1)
         dice_loss = 1 - (2 * intersection + 1) / (flat_p.sum(1) + flat_t.sum(1) + 1)

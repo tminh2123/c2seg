@@ -8,8 +8,9 @@ from scipy.ndimage import distance_transform_edt
 
 
 def dice_score(pred: torch.Tensor, target: torch.Tensor, threshold: float = 0.5) -> float:
-    """pred/target: [B, 1, H, W] float tensors (logits or probs)."""
-    pred = (torch.sigmoid(pred) > threshold).float()
+    """pred/target: [B, 1, H, W] float tensors (probs after sigmoid)."""
+    # Model output already has sigmoid, so just threshold directly
+    pred = (pred > threshold).float()
     flat_p = pred.flatten(1)
     flat_t = target.flatten(1)
     intersection = (flat_p * flat_t).sum(1)
@@ -18,7 +19,8 @@ def dice_score(pred: torch.Tensor, target: torch.Tensor, threshold: float = 0.5)
 
 
 def miou_score(pred: torch.Tensor, target: torch.Tensor, threshold: float = 0.5) -> float:
-    pred = (torch.sigmoid(pred) > threshold).float()
+    """pred/target: [B, 1, H, W] float tensors (probs after sigmoid)."""
+    pred = (pred > threshold).float()
     flat_p = pred.flatten(1)
     flat_t = target.flatten(1)
     intersection = (flat_p * flat_t).sum(1)
@@ -46,7 +48,8 @@ def _erode(arr: np.ndarray) -> np.ndarray:
 
 
 def hd95(pred: torch.Tensor, target: torch.Tensor, threshold: float = 0.5) -> float:
-    pred_bin = (torch.sigmoid(pred) > threshold).cpu().numpy().astype(bool)
+    """pred/target: [B, 1, H, W] float tensors (probs after sigmoid)."""
+    pred_bin = (pred > threshold).cpu().numpy().astype(bool)
     gt_bin   = target.cpu().numpy().astype(bool)
 
     scores = []
@@ -63,7 +66,8 @@ def hd95(pred: torch.Tensor, target: torch.Tensor, threshold: float = 0.5) -> fl
 
 
 def assd(pred: torch.Tensor, target: torch.Tensor, threshold: float = 0.5) -> float:
-    pred_bin = (torch.sigmoid(pred) > threshold).cpu().numpy().astype(bool)
+    """pred/target: [B, 1, H, W] float tensors (probs after sigmoid)."""
+    pred_bin = (pred > threshold).cpu().numpy().astype(bool)
     gt_bin   = target.cpu().numpy().astype(bool)
 
     scores = []

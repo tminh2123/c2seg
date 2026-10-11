@@ -2,59 +2,52 @@
 C2Seg: Consistency-enhanced Two-stage Segmentation
 Paper: "Towards Text-Mask Consistency in Medical Image Segmentation" (ICLR 2026)
 
-Architecture:
-  Stage I  - Cluster-aware Contrastive Learning (CaCL)
-  Stage II - Dual encoder + BCAM + K-Gate + U-Net decoder
+Architecture follows ref/c2seg implementation:
+  - Visual Encoder: 5 DownBlocks (Conv only, no KAN)
+  - BCAM: Bidirectional Cross Attention with Sinusoidal2D + KCGate
+  - Decoder: UpBlockAttention with PixLevelModule
+  - KAN only used in KCGate (gating mechanism)
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import CLIPTextModel, CLIPTokenizer
 
-# Import real KAN implementation
+# Import KAN implementation
 from .kan import KANLinear
 
 
 # ---------------------------------------------------------------------------
-# KAN layer wrapper for easy use
+# Simple KAN wrapper for KCGate
 # ---------------------------------------------------------------------------
-class KANLayer(nn.Module):
-    """
-    Wrapper for KANLinear with proper initialization for C2Seg.
-    Handles both 2D [batch, features] and 3D [batch, seq, features] inputs.
-    """
+class SimpleKANLayer(nn.Module):
+    """Simple KANLinear wrapper for gating."""
     def __init__(self, in_dim: int, out_dim: int, grid_size: int = 5, spline_order: int = 3):
         super().__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.kan = KANLinear(
-            in_dim, 
-            out_dim,
+            in_dim, out_dim,
             grid_size=grid_size,
             spline_order=spline_order,
             grid_range=[-1, 1],
         )
 
     def forward(self, x):
-        # Handle 3D input [B, N, C] -> flatten -> KAN -> unflatten
         if x.dim() == 3:
             B, N, C = x.shape
             x = x.reshape(B * N, C)
             x = self.kan(x)
             x = x.reshape(B, N, self.out_dim)
             return x
-        # 2D input [batch, features]
         return self.kan(x)
 
 
 class MLPLayer(nn.Module):
-    """
-    MLP replacement for KANLayer - for ablation study.
-    Same interface as KANLayer but uses Linear layers.
-    """
+    """MLP replacement for ablation study."""
     def __init__(self, in_dim: int, out_dim: int, grid_size: int = 5, spline_order: int = 3):
-        # grid_size and spline_order ignored, kept for API compatibility
         super().__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
@@ -65,115 +58,278 @@ class MLPLayer(nn.Module):
         )
 
     def forward(self, x):
-        # Handle 3D input [B, N, C]
         if x.dim() == 3:
             B, N, C = x.shape
             x = x.reshape(B * N, C)
             x = self.mlp(x)
             x = x.reshape(B, N, self.out_dim)
             return x
-        # 2D input [batch, features]
         return self.mlp(x)
 
 
 # ---------------------------------------------------------------------------
-# Visual Encoder: 3 Conv blocks + 2 KAN layers, returns multi-scale features
+# Sinusoidal 2D Position Embedding (from ref/c2seg)
 # ---------------------------------------------------------------------------
-class ConvBlock(nn.Module):
-    def __init__(self, in_ch, out_ch):
+class Sinusoidal2DPositionEmbedding(nn.Module):
+    """
+    2D sinusoidal position embedding for image features.
+    Generates deterministic positional encodings of shape [1, C, H, W].
+    """
+    def __init__(self, num_channels: int, height: int, width: int):
         super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
+        assert num_channels % 4 == 0, "Embedding dim must be divisible by 4 for 2D encoding"
+        self.num_channels = num_channels
+        self.height = height
+        self.width = width
+        self.register_buffer("pos_encoding", self._build_sincos_pos_encoding())
+
+    def _build_sincos_pos_encoding(self) -> torch.Tensor:
+        pe = torch.zeros(self.num_channels, self.height, self.width)
+
+        y_pos = torch.arange(self.height, dtype=torch.float32).unsqueeze(1).repeat(1, self.width)
+        x_pos = torch.arange(self.width, dtype=torch.float32).unsqueeze(0).repeat(self.height, 1)
+
+        half_dim = self.num_channels // 2
+        div_term = torch.exp(torch.arange(0, half_dim, 2).float() * -(math.log(10000.0) / half_dim))
+
+        pe[0::4, :, :] = torch.sin(y_pos[None, :, :] * div_term[:, None, None])
+        pe[1::4, :, :] = torch.cos(y_pos[None, :, :] * div_term[:, None, None])
+        pe[2::4, :, :] = torch.sin(x_pos[None, :, :] * div_term[:, None, None])
+        pe[3::4, :, :] = torch.cos(x_pos[None, :, :] * div_term[:, None, None])
+
+        return pe.unsqueeze(0)  # [1, C, H, W]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.pos_encoding
+
+
+# ---------------------------------------------------------------------------
+# Pixel Level Attention Module (from ref/c2seg)
+# ---------------------------------------------------------------------------
+class PixLevelModule(nn.Module):
+    """
+    Pixel-Level Attention Module for skip connections.
+    Combines average-pooled and max-pooled features to generate pixel-wise attention.
+    """
+    def __init__(self, in_channels: int, reduction_ratio: int = 2):
+        super().__init__()
+        self.conv_avg = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True)
+        )
+        self.conv_max = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True)
+        )
+        self.bottleneck = nn.Sequential(
+            nn.Linear(3, 3 * reduction_ratio),
             nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
+            nn.Linear(3 * reduction_ratio, 1)
         )
 
-    def forward(self, x):
-        return self.block(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        avg_feat = torch.mean(self.conv_avg(x), dim=1, keepdim=True)
+        max_feat = torch.max(self.conv_max(x), dim=1, keepdim=True).values
+
+        combined = torch.cat([avg_feat, max_feat, avg_feat + max_feat], dim=1)
+        out = combined.permute(0, 2, 3, 1)
+        out = self.bottleneck(out)
+        out = out.permute(0, 3, 1, 2)
+
+        return x * out
 
 
-class VisualEncoder(nn.Module):
+# ---------------------------------------------------------------------------
+# KCGate: KAN-based Gating (from ref/c2seg BCAM)
+# ---------------------------------------------------------------------------
+class KCGate(nn.Module):
     """
-    Produces 5 multi-scale feature maps V1..V5 (progressively downsampled).
-    Default channels: 64 -> 128 -> 256 -> 512 -> 512
-    First 3 stages are CNN, last 2 are KAN/MLP (as per paper Figure 2).
+    KAN-based Channel Gate.
+    g = tanh(KAN(ReLU(KAN(x))))
+    """
+    def __init__(self, in_channels: int, grid_size: int = 5, spline_order: int = 3, use_kan: bool = True):
+        super().__init__()
+        Layer = SimpleKANLayer if use_kan else MLPLayer
+        self.gate1 = Layer(in_channels, in_channels, grid_size, spline_order)
+        self.gate2 = Layer(in_channels, in_channels, grid_size, spline_order)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, N, C] or [B, HW, C]
+        Returns:
+            gated output [B, N, C]
+        """
+        g = self.gate1(x)
+        g = F.relu(g)
+        g = self.gate2(g)
+        g = torch.tanh(g)
+        return x * g
+
+
+# ---------------------------------------------------------------------------
+# BCAM: Bidirectional Cross Attention Module (from ref/c2seg)
+# ---------------------------------------------------------------------------
+class BCAModule(nn.Module):
+    """
+    Bidirectional Cross Attention (BCA) module.
+    Performs cross-attention between image and text features.
     """
     def __init__(
         self, 
-        in_channels: int = 3, 
-        kan_grid_size: int = 5, 
-        kan_spline_order: int = 3,
-        channels: list = None,  # Custom channel dims [c1, c2, c3, c4, c5]
-        use_kan: bool = True,   # False to use MLP instead
+        img_size: int, 
+        in_channels: int, 
+        num_heads: int = 8, 
+        dropout: float = 0.0,
+        grid_size: int = 5,
+        spline_order: int = 3,
+        use_kan: bool = True,
     ):
         super().__init__()
-        self.kan_grid_size = kan_grid_size
-        self.kan_spline_order = kan_spline_order
-        self.use_kan = use_kan
-        
-        # Select layer type
-        Layer = KANLayer if use_kan else MLPLayer
-        
-        # Default or custom channels
-        if channels is None:
-            channels = [64, 128, 256, 512, 512]
-        c1, c2, c3, c4, c5 = channels
-        
-        # 3 CNN stages
-        self.enc1 = ConvBlock(in_channels, c1)   # H x W
-        self.enc2 = ConvBlock(c1, c2)            # H/2 x W/2
-        self.enc3 = ConvBlock(c2, c3)            # H/4 x W/4
-        self.pool = nn.MaxPool2d(2)
+        self.img_size = img_size
+        self.in_channels = in_channels
+        self.num_heads = num_heads
 
-        # 2 KAN/MLP stages (operate channel-wise via 1x1-style reshape)
-        self.stage4 = self._make_stage(c3, c4, Layer)  # H/8 x W/8
-        self.stage5 = self._make_stage(c4, c5, Layer)  # H/16 x W/16
-        
-        self.out_channels = c5  # For global vector dim
+        self.pos_embed = Sinusoidal2DPositionEmbedding(in_channels, img_size, img_size)
 
-    def _make_stage(self, in_ch, out_ch, Layer):
+        # Projection layers (Conv1d like ref)
+        self.v_key = self._make_conv(in_channels, in_channels)
+        self.v_value = self._make_conv(in_channels, in_channels)
+        self.l_key = self._make_conv(512, in_channels)  # CLIP text dim = 512
+        self.l_value = self._make_conv(512, in_channels)
+
+        # KAN-based gating
+        self.gate_v = KCGate(in_channels, grid_size, spline_order, use_kan)
+        self.gate_l = KCGate(in_channels, grid_size, spline_order, use_kan)
+
+        # Output projection
+        self.project = nn.Sequential(
+            nn.Conv1d(in_channels, in_channels, kernel_size=1),
+            nn.InstanceNorm1d(in_channels),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+
+    @staticmethod
+    def _make_conv(in_ch: int, out_ch: int) -> nn.Sequential:
         return nn.Sequential(
-            nn.MaxPool2d(2),
-            _SpatialLayer(in_ch, out_ch, self.kan_grid_size, self.kan_spline_order, Layer),
+            nn.Conv1d(in_ch, out_ch, kernel_size=1, stride=1),
+            nn.InstanceNorm1d(out_ch)
+        )
+
+    def forward(self, img_feat: torch.Tensor, text_feat: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            img_feat: [B, C, H, W]
+            text_feat: [B, N, C_txt] where C_txt=512
+
+        Returns:
+            Fused features [B, C, H, W]
+        """
+        b, c, h, w = img_feat.shape
+        hw = h * w
+        n_t = text_feat.size(1)
+
+        # Flatten image features and add position encoding
+        img_flat = img_feat.flatten(2)  # [B, C, HW]
+        v = self.pos_embed(img_feat).flatten(2)  # [B, C, HW]
+        l = text_feat.transpose(1, 2)  # [B, C_txt, N]
+
+        # Keys and values
+        v_key, v_value = self.v_key(v), self.v_value(v)  # [B, C, HW]
+        l_key, l_value = self.l_key(l), self.l_value(l)  # [B, C, N]
+
+        # Reshape for multi-head attention
+        head_dim = self.in_channels // self.num_heads
+        v_key = v_key.view(b, self.num_heads, head_dim, hw).permute(0, 1, 3, 2)      # [B, H, HW, D]
+        l_key = l_key.view(b, self.num_heads, head_dim, n_t)                          # [B, H, D, N]
+        v_value = v_value.view(b, self.num_heads, head_dim, hw).permute(0, 1, 3, 2)  # [B, H, HW, D]
+        l_value = l_value.view(b, self.num_heads, head_dim, n_t).permute(0, 1, 3, 2) # [B, H, N, D]
+
+        # Attention maps
+        sim_map = torch.matmul(v_key, l_key) * (self.in_channels ** -0.5)  # [B, H, HW, N]
+        attn_v2l = F.softmax(sim_map, dim=-1)                               # [B, H, HW, N]
+        attn_l2v = F.softmax(sim_map.transpose(-1, -2), dim=-1)             # [B, H, N, HW]
+
+        # Cross attention
+        v_out = torch.matmul(attn_v2l, l_value)                             # [B, H, HW, D]
+        v_out = v_out.permute(0, 2, 1, 3).reshape(b, hw, c)                 # [B, HW, C]
+        a_v = self.gate_v(v_out).permute(0, 2, 1)                           # [B, C, HW]
+
+        l_out = torch.matmul(attn_l2v, v_value)                             # [B, H, N, D]
+        l_out = l_out.permute(0, 2, 1, 3).reshape(b, n_t, c)                # [B, N, C]
+        # Broadcast l_out to spatial: average over text tokens
+        l_out_spatial = l_out.mean(dim=1, keepdim=True).expand(-1, hw, -1)  # [B, HW, C]
+        a_l = self.gate_l(l_out_spatial).permute(0, 2, 1)                   # [B, C, HW]
+
+        # Fuse and project
+        fused = self.project(img_flat + a_v * a_l).view(b, c, h, w)
+
+        return fused
+
+
+# ---------------------------------------------------------------------------
+# Basic Conv blocks (from ref/c2seg)
+# ---------------------------------------------------------------------------
+class ConvBNReLU(nn.Module):
+    """Convolution + BatchNorm + ReLU"""
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.op = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
         )
 
     def forward(self, x):
-        v1 = self.enc1(x)                  # [B, c1, H,   W]
-        v2 = self.enc2(self.pool(v1))      # [B, c2, H/2, W/2]
-        v3 = self.enc3(self.pool(v2))      # [B, c3, H/4, W/4]
-        v4 = self.stage4(v3)               # [B, c4, H/8, W/8]
-        v5 = self.stage5(v4)               # [B, c5, H/16,W/16]
-
-        # global image vector
-        v_global = F.adaptive_avg_pool2d(v5, 1).flatten(1)  # [B, c5]
-        return [v1, v2, v3, v4, v5], v_global
+        return self.op(x)
 
 
-class _SpatialLayer(nn.Module):
-    """Apply KAN/MLP across channels at each spatial location."""
-    def __init__(self, in_ch, out_ch, grid_size: int = 5, spline_order: int = 3, Layer=KANLayer):
+def conv_stack(in_channels, out_channels, num_layers):
+    """Stack of Conv-BN-ReLU layers"""
+    layers = [ConvBNReLU(in_channels, out_channels)]
+    layers += [ConvBNReLU(out_channels, out_channels) for _ in range(num_layers - 1)]
+    return nn.Sequential(*layers)
+
+
+class DownBlock(nn.Module):
+    """Down-sampling block with stacked conv layers"""
+    def __init__(self, in_channels, out_channels, num_layers=2):
         super().__init__()
-        self.layer = Layer(in_ch, out_ch, grid_size, spline_order)
+        self.convs = conv_stack(in_channels, out_channels, num_layers)
 
     def forward(self, x):
-        B, C, H, W = x.shape
-        x = x.permute(0, 2, 3, 1).reshape(-1, C)   # [B*H*W, C]
-        x = self.layer(x)
-        x = x.reshape(B, H, W, -1).permute(0, 3, 1, 2)
-        return x
+        return self.convs(x)
+
+
+class UpBlockAttention(nn.Module):
+    """Up-sampling block with PixLevelModule attention on skip connection"""
+    def __init__(self, skip_channels, up_channels, out_channels, num_layers=2):
+        super().__init__()
+        self.att = PixLevelModule(skip_channels)
+        self.up = nn.ConvTranspose2d(up_channels, up_channels, kernel_size=2, stride=2)
+        self.convs = conv_stack(skip_channels + up_channels, out_channels, num_layers)
+
+    def forward(self, skip_x, x):
+        skip_att = self.att(skip_x)
+        up_x = self.up(x)
+        # Handle size mismatch
+        if up_x.shape[2:] != skip_att.shape[2:]:
+            up_x = F.interpolate(up_x, size=skip_att.shape[2:], mode='bilinear', align_corners=False)
+        out = torch.cat([skip_att, up_x], dim=1)
+        return self.convs(out)
 
 
 # ---------------------------------------------------------------------------
 # Language Encoder wrapper (frozen CLIP)
 # ---------------------------------------------------------------------------
 class LanguageEncoder(nn.Module):
-    def __init__(self, clip_model: str = "openai/clip-vit-base-patch32", max_length: int = 77):
+    def __init__(self, clip_model: str = "openai/clip-vit-base-patch32", max_length: int = 18):
         super().__init__()
         self.tokenizer = CLIPTokenizer.from_pretrained(clip_model)
-        self.encoder   = CLIPTextModel.from_pretrained(clip_model)
+        self.encoder = CLIPTextModel.from_pretrained(clip_model)
         self.max_length = max_length
         # freeze
         for p in self.encoder.parameters():
@@ -185,318 +341,161 @@ class LanguageEncoder(nn.Module):
             max_length=self.max_length, return_tensors="pt"
         ).to(device)
         out = self.encoder(**tokens)
-        token_emb = out.last_hidden_state          # [B, N, d_t]
-        sent_emb  = out.pooler_output              # [B, d_t]
-        return token_emb, sent_emb                 # d_t = 512 for ViT-B/32
+        token_emb = out.last_hidden_state  # [B, N, 512]
+        sent_emb = out.pooler_output       # [B, 512]
+        return token_emb, sent_emb
 
 
 # ---------------------------------------------------------------------------
-# Per-scale language projection
-# ---------------------------------------------------------------------------
-class LangProjection(nn.Module):
-    def __init__(self, d_t: int, channels: list):
-        super().__init__()
-        self.projs = nn.ModuleList([nn.Linear(d_t, c) for c in channels])
-
-    def forward(self, token_emb):
-        # token_emb: [B, N, d_t]
-        return [proj(token_emb) for proj in self.projs]  # list of [B, N, C_ω]
-
-
-# ---------------------------------------------------------------------------
-# BCAM: Bidirectional Complementary Attention Module
-# ---------------------------------------------------------------------------
-class BCAM(nn.Module):
-    def __init__(self, vis_ch: int, lang_ch: int, grid_size: int = 5, spline_order: int = 3, use_kan: bool = True):
-        super().__init__()
-        d = vis_ch
-        Layer = KANLayer if use_kan else MLPLayer
-        self.v_key   = Layer(vis_ch,  d, grid_size, spline_order)
-        self.v_value = Layer(vis_ch,  d, grid_size, spline_order)
-        self.l_key   = Layer(lang_ch, d, grid_size, spline_order)
-        self.l_value = Layer(lang_ch, d, grid_size, spline_order)
-        self.scale   = d ** -0.5
-
-    def forward(self, V, L_w):
-        """
-        V:   [B, C, H, W]  visual features
-        L_w: [B, N, C]     language tokens (projected to same C)
-        Returns F_v, F_l both [B, C, H, W]
-        
-        Paper equations:
-        - Eq. 4: A = (1/√d) * V_key @ L_key^T  ∈ ℝ^(P×N)
-        - Eq. 5: F_v = Softmax_N(A) @ L_value  ∈ ℝ^(P×C)
-        - Eq. 6: F_l = (1/N) * Σ_n [ Softmax_P(A^T[n,:]) ⊙ V_value ]  ∈ ℝ^(P×C)
-        
-        Memory-efficient: uses einsum to avoid creating [B, N, P, C] tensor
-        """
-        B, C, H, W = V.shape
-        P = H * W
-        N = L_w.shape[1]
-
-        # Flatten spatial: V [B, C, H, W] -> V_flat [B, P, C]
-        V_flat = V.flatten(2).permute(0, 2, 1)   # [B, P, C]
-
-        # KAN projections for keys & values
-        Vk = self.v_key(V_flat)                   # [B, P, d]
-        Vv = self.v_value(V_flat)                 # [B, P, C]
-        Lk = self.l_key(L_w)                      # [B, N, d]
-        Lv = self.l_value(L_w)                    # [B, N, C]
-
-        # Eq. 4: Attention scores A = (1/√d) * V_key @ L_key^T
-        A = torch.bmm(Vk, Lk.transpose(1, 2)) * self.scale  # [B, P, N]
-
-        # --- Eq. 5: Vision-dominant path ---
-        # F_v = Softmax_N(A) @ L_value
-        attn_v = F.softmax(A, dim=2)              # [B, P, N] softmax over N
-        F_v = torch.bmm(attn_v, Lv)               # [B, P, C]
-
-        # --- Eq. 6: Language-dominant path (memory efficient) ---
-        # F_l = (1/N) * Σ_n [ Softmax_P(A^T[n,:]) ⊙ V_value ]
-        # Instead of expanding to [B, N, P, C], use einsum:
-        # attn_l[b,n,p] * Vv[b,p,c] -> sum over n -> [b,p,c]
-        A_T = A.transpose(1, 2)                   # [B, N, P]
-        attn_l = F.softmax(A_T, dim=2)            # [B, N, P] softmax over P
-        
-        # einsum: 'bnp,bpc->bpc' means: for each (b,p,c), sum over n: attn_l[b,n,p] * Vv[b,p,c]
-        # This is equivalent to: (attn_l.sum(dim=1).unsqueeze(-1) * Vv) but we need weighted sum
-        # Correct form: for each position p, weight Vv[p] by attention from all N tokens
-        # F_l[b,p,c] = (1/N) * sum_n(attn_l[b,n,p]) * Vv[b,p,c]
-        # But that's wrong - we need element-wise per n then sum
-        # 
-        # Actually Eq.6: F_l = (1/N) * Σ_n [ w_n ⊙ V_value ] where w_n = softmax_P(A^T[n,:])
-        # This means: weighted average of V_value, where weight at position p is avg of attn from all tokens
-        # F_l[b,p,c] = (1/N) * Σ_n attn_l[b,n,p] * Vv[b,p,c]
-        #            = Vv[b,p,c] * (1/N) * Σ_n attn_l[b,n,p]
-        #            = Vv[b,p,c] * mean_n(attn_l[b,n,p])
-        attn_l_mean = attn_l.mean(dim=1)          # [B, P] - average attention across all N tokens
-        F_l = Vv * attn_l_mean.unsqueeze(-1)      # [B, P, C]
-
-        # Reshape back to spatial [B, C, H, W]
-        F_v = F_v.permute(0, 2, 1).reshape(B, C, H, W)
-        F_l = F_l.permute(0, 2, 1).reshape(B, C, H, W)
-        return F_v, F_l
-
-
-# ---------------------------------------------------------------------------
-# K-Gate: KAN-based Attention Gating
-# ---------------------------------------------------------------------------
-class KGate(nn.Module):
-    """
-    KAN/MLP-based Attention Gating (Section 3.4, Eq. 7)
-    
-    Each path: Layer → ReLU → Layer → Tanh
-    
-    g_v = tanh(Layer(ReLU(Layer(F_v))))
-    g_l = tanh(Layer(ReLU(Layer(F_l))))
-    F_v^g = F_v ⊙ g_v,  F_l^g = F_l ⊙ g_l
-    F_out = Conv1x1([F_v^g || F_l^g])
-    """
-    def __init__(self, ch: int, grid_size: int = 5, spline_order: int = 3, use_kan: bool = True):
-        super().__init__()
-        Layer = KANLayer if use_kan else MLPLayer
-        
-        # LayerNorm for stability
-        self.norm_v = nn.LayerNorm(ch)
-        self.norm_l = nn.LayerNorm(ch)
-        
-        # Gating: Layer → ReLU → Layer → Tanh (as per paper Figure 2)
-        self.gate_v = nn.Sequential(
-            Layer(ch, ch, grid_size, spline_order),
-            nn.ReLU(),
-            Layer(ch, ch, grid_size, spline_order),
-            nn.Tanh()
-        )
-        self.gate_l = nn.Sequential(
-            Layer(ch, ch, grid_size, spline_order),
-            nn.Tanh()
-        )
-        
-        # 1x1 conv for channel alignment after concatenation
-        self.fuse = nn.Conv2d(ch * 2, ch, 1)
-
-    def forward(self, F_v, F_l):
-        """
-        F_v, F_l: [B, C, H, W] from BCAM
-        Returns: F_out [B, C, H, W]
-        
-        Process per-sample to reduce memory (avoid B*H*W explosion)
-        """
-        B, C, H, W = F_v.shape
-        
-        g_v_list = []
-        g_l_list = []
-        
-        for b in range(B):
-            # Single sample: [H*W, C]
-            fv = F_v[b].permute(1, 2, 0).reshape(-1, C)  # [H*W, C]
-            fl = F_l[b].permute(1, 2, 0).reshape(-1, C)
-            
-            # Normalize
-            fv_norm = self.norm_v(fv)
-            fl_norm = self.norm_l(fl)
-            
-            # KAN gating
-            gv = self.gate_v(fv_norm)  # [H*W, C]
-            gl = self.gate_l(fl_norm)
-            
-            g_v_list.append(gv.reshape(H, W, C).permute(2, 0, 1))  # [C, H, W]
-            g_l_list.append(gl.reshape(H, W, C).permute(2, 0, 1))
-        
-        g_v = torch.stack(g_v_list, dim=0)  # [B, C, H, W]
-        g_l = torch.stack(g_l_list, dim=0)
-        
-        # Element-wise gating
-        Fv_g = F_v * g_v
-        Fl_g = F_l * g_l
-        
-        # Concatenate and fuse
-        F_out = self.fuse(torch.cat([Fv_g, Fl_g], dim=1))
-        
-        return F_out
-
-
-# ---------------------------------------------------------------------------
-# Decoder block (U-Net style)
-# ---------------------------------------------------------------------------
-class DecoderBlock(nn.Module):
-    def __init__(self, in_ch, skip_ch, out_ch):
-        super().__init__()
-        self.up   = nn.ConvTranspose2d(in_ch, out_ch, 2, stride=2)
-        self.conv = ConvBlock(out_ch + skip_ch, out_ch)
-
-    def forward(self, x, skip):
-        x = self.up(x)
-        if x.shape != skip.shape:
-            x = F.interpolate(x, size=skip.shape[2:], mode='bilinear', align_corners=False)
-        return self.conv(torch.cat([x, skip], dim=1))
-
-
-# ---------------------------------------------------------------------------
-# Full C2Seg model
+# Full C2Seg model (MBINet architecture from ref/c2seg)
 # ---------------------------------------------------------------------------
 class C2Seg(nn.Module):
-
+    """
+    Multiscale Bidirectional Interaction Network (MBINet).
+    Following ref/c2seg architecture exactly.
+    """
     def __init__(
         self,
         in_channels: int = 3,
         num_classes: int = 1,
-        clip_model: str  = "openai/clip-vit-base-patch32",
-        d_t: int         = 512,
-        use_text: bool   = True,  # Set False to disable BCAM/K-Gate (ablation)
-        use_bcam: bool   = True,  # Set False to skip BCAM (ablation)
-        use_kgate: bool  = True,  # Set False to skip K-Gate (ablation)
-        use_kan: bool    = True,  # Set False to use MLP instead of KAN (ablation)
-        kan_grid_size: int = 5,   # U-KAN default
-        kan_spline_order: int = 3,  # U-KAN default (cubic spline)
-        channel_scale: float = 1.0,  # Scale factor for channels (0.5 = half, 0.25 = quarter)
+        img_size: int = 224,
+        clip_model: str = "openai/clip-vit-base-patch32",
+        d_t: int = 512,
+        max_token_len: int = 18,
+        base_channel: int = 64,
+        channel_scale: float = 1.0,
+        num_heads: int = 8,
+        dropout: float = 0.5,
+        use_text: bool = True,
+        use_bcam: bool = True,
+        use_kan: bool = True,
+        kan_grid_size: int = 5,
+        kan_spline_order: int = 3,
+        deep_supervision: bool = False,
+        # Unused params for compatibility
+        use_kgate: bool = True,
+        drop_path_rate: float = 0.,
     ):
         super().__init__()
+        self.deep_supervision = deep_supervision
         self.use_text = use_text
         self.use_bcam = use_bcam
-        self.use_kgate = use_kgate
-        self.use_kan = use_kan
         
-        # Scale channels (KAN can use narrower networks)
-        base_channels = [64, 128, 256, 512, 512]
-        self.VIS_CHANNELS = [max(16, int(c * channel_scale)) for c in base_channels]
-        self.BCAM_CHANNELS = self.VIS_CHANNELS[1:]  # Skip first scale
-        
-        self.visual_enc = VisualEncoder(
-            in_channels, kan_grid_size, kan_spline_order, 
-            channels=self.VIS_CHANNELS,
-            use_kan=use_kan,
-        )
-        
+        # Scale base channel
+        base_ch = max(16, int(base_channel * channel_scale))
+        img_scales = [img_size, img_size//2, img_size//4, img_size//8, img_size//16]
+
+        # Vision encoder (Conv only, no KAN)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.down0 = DownBlock(in_channels, base_ch)
+        self.down1 = DownBlock(base_ch, base_ch * 2)
+        self.down2 = DownBlock(base_ch * 2, base_ch * 4)
+        self.down3 = DownBlock(base_ch * 4, base_ch * 8)
+        self.down4 = DownBlock(base_ch * 8, base_ch * 8)
+
+        # Vision decoder with PixLevelModule
+        self.up3 = UpBlockAttention(base_ch * 8, base_ch * 8, base_ch * 4)
+        self.up2 = UpBlockAttention(base_ch * 4, base_ch * 4, base_ch * 2)
+        self.up1 = UpBlockAttention(base_ch * 2, base_ch * 2, base_ch)
+        self.up0 = UpBlockAttention(base_ch, base_ch, base_ch)
+
+        # Language encoder (frozen CLIP)
         if use_text:
-            self.lang_enc   = LanguageEncoder(clip_model)
-            # Language projection for all 5 scales (needed for indexing)
-            self.lang_proj  = LangProjection(d_t, self.VIS_CHANNELS)
+            self.lang_enc = LanguageEncoder(clip_model, max_length=max_token_len)
 
-            # BCAM at 4 scales (v2, v3, v4, v5 - skip v1) as per paper Figure 2
+            # Cross-modal fusion (BCAM at 4 scales: v1, v2, v3, v4)
             if use_bcam:
-                self.bcam = nn.ModuleList([
-                    BCAM(c, c, kan_grid_size, kan_spline_order, use_kan=use_kan) for c in self.BCAM_CHANNELS
-                ])
-            
-            # K-Gate at 4 scales (same as BCAM)
-            if use_kgate:
-                self.kgate = nn.ModuleList([
-                    KGate(c, kan_grid_size, kan_spline_order, use_kan=use_kan) for c in self.BCAM_CHANNELS
-                ])
-            
-            # Simple fusion layer when not using K-Gate
-            if use_bcam and not use_kgate:
-                self.simple_fuse = nn.ModuleList([
-                    nn.Conv2d(c * 2, c, 1) for c in self.BCAM_CHANNELS
-                ])
+                self.fuse1 = BCAModule(img_scales[1], base_ch, num_heads, dropout, 
+                                       kan_grid_size, kan_spline_order, use_kan)
+                self.fuse2 = BCAModule(img_scales[2], base_ch * 2, num_heads, dropout,
+                                       kan_grid_size, kan_spline_order, use_kan)
+                self.fuse3 = BCAModule(img_scales[3], base_ch * 4, num_heads, dropout,
+                                       kan_grid_size, kan_spline_order, use_kan)
+                self.fuse4 = BCAModule(img_scales[4], base_ch * 8, num_heads, dropout,
+                                       kan_grid_size, kan_spline_order, use_kan)
 
-        # Decoder channels also scaled
-        dec_ch = self.VIS_CHANNELS
-        self.dec4 = DecoderBlock(dec_ch[4], dec_ch[3], dec_ch[2])
-        self.dec3 = DecoderBlock(dec_ch[2], dec_ch[2], dec_ch[1])
-        self.dec2 = DecoderBlock(dec_ch[1], dec_ch[1], dec_ch[0])
-        self.dec1 = DecoderBlock(dec_ch[0], dec_ch[0], max(16, dec_ch[0]//2))
-        self.head = nn.Conv2d(max(16, dec_ch[0]//2), num_classes, 1)
+        # Output heads
+        self.out0 = nn.Sequential(nn.Conv2d(base_ch, num_classes, 1), nn.Sigmoid())
+        
+        if self.deep_supervision:
+            self.out1 = nn.Sequential(nn.Conv2d(base_ch, num_classes, 1), nn.Sigmoid())
+            self.out2 = nn.Sequential(nn.Conv2d(base_ch * 2, num_classes, 1), nn.Sigmoid())
+            self.out3 = nn.Sequential(nn.Conv2d(base_ch * 4, num_classes, 1), nn.Sigmoid())
+            self.out4 = nn.Sequential(nn.Conv2d(base_ch * 8, num_classes, 1), nn.Sigmoid())
 
-        # projection from sentence embedding to global visual for CaCL
-        self.img_proj  = nn.Linear(dec_ch[4], 256)
+        # Projections for CaCL pretraining
+        self.img_proj = nn.Linear(base_ch * 8, 256)
         self.text_proj = nn.Linear(d_t, 256)
-
-    def encode(self, images, texts):
-        """Extract visual & language features."""
-        feats, v_global = self.visual_enc(images)
-        if self.use_text:
-            token_emb, sent_emb = self.lang_enc(texts, images.device)
-            lang_per_scale = self.lang_proj(token_emb)  # list of [B, N, C_ω]
-            return feats, v_global, token_emb, sent_emb, lang_per_scale
-        return feats, v_global, None, None, None
+        
+        # Store for param counting
+        self.base_ch = base_ch
 
     def forward(self, images, texts=None):
-        feats, v_global, _, _, lang_per_scale = self.encode(images, texts)
+        # Encode text if provided
+        l = None
+        if self.use_text and texts is not None:
+            token_emb, _ = self.lang_enc(texts, images.device)
+            l = token_emb  # [B, N, 512]
 
-        if self.use_text and lang_per_scale is not None:
-            # feats[0] (v1) passes through without BCAM/K-Gate
-            # feats[1:5] (v2-v5) go through BCAM + K-Gate
-            fused = [feats[0]]  # v1 unchanged
+        # Encode image (vision stream)
+        v0 = self.down0(images)              # [B, C, 224, 224]
+        v1 = self.down1(self.pool(v0))       # [B, 2C, 112, 112]
+        v2 = self.down2(self.pool(v1))       # [B, 4C, 56, 56]
+        v3 = self.down3(self.pool(v2))       # [B, 8C, 28, 28]
+        v4 = self.down4(self.pool(v3))       # [B, 8C, 14, 14]
+
+        # Cross-modal fusion + decoder
+        if self.use_text and self.use_bcam and l is not None:
+            f4 = self.fuse4(v4, l)
             
-            for i, (V, L_w) in enumerate(zip(feats[1:], lang_per_scale[1:])):
-                # i=0 → feats[1], i=1 → feats[2], etc.
-                if self.use_bcam:
-                    # BCAM produces F_v (vision-dominant) and F_l (language-dominant)
-                    F_v, F_l = self.bcam[i](V, L_w)
-                    
-                    if self.use_kgate:
-                        # K-Gate fuses F_v and F_l with KAN-based gating
-                        fused.append(self.kgate[i](F_v, F_l))
-                    else:
-                        # Simple concat + conv fusion (no K-Gate)
-                        fused.append(self.simple_fuse[i](torch.cat([F_v, F_l], dim=1)))
-                else:
-                    # No BCAM - just use visual features
-                    fused.append(V)
+            up3 = self.up3(v3, f4)
+            f3 = self.fuse3(up3, l)
+            
+            up2 = self.up2(v2, f3)
+            f2 = self.fuse2(up2, l)
+            
+            up1 = self.up1(v1, f2)
+            f1 = self.fuse1(up1, l)
+            
+            up0 = self.up0(v0, f1)
         else:
-            # No text fusion - just use visual features directly
-            fused = feats
+            # No text fusion
+            up3 = self.up3(v3, v4)
+            up2 = self.up2(v2, up3)
+            up1 = self.up1(v1, up2)
+            up0 = self.up0(v0, up1)
+            f1, f2, f3, f4 = up1, up2, up3, v4
 
-        # U-Net decoder with skip connections from fused features
-        x = fused[4]                              # [B, 512, H/16, W/16]
-        x = self.dec4(x, fused[3])               # [B, 256, H/8,  W/8]
-        x = self.dec3(x, fused[2])               # [B, 128, H/4,  W/4]
-        x = self.dec2(x, fused[1])               # [B, 64,  H/2,  W/2]
-        x = self.dec1(x, fused[0])               # [B, 32,  H,    W]
-        return self.head(x)                       # [B, num_classes, H, W]
+        out0 = self.out0(up0)
+
+        if self.deep_supervision:
+            return (out0,
+                    self.out1(f1),
+                    self.out2(f2),
+                    self.out3(f3),
+                    self.out4(f4))
+        return out0
 
     def get_contrastive_embeddings(self, images, texts):
-        """For CaCL pretraining: lightweight forward — only visual global vec + sent_emb."""
+        """For CaCL pretraining."""
         if not self.use_text:
             raise RuntimeError("Cannot use get_contrastive_embeddings when use_text=False")
-        
-        # only need v_global, skip BCAM/lang_proj overhead
-        feats, v_global = self.visual_enc(images)
+
+        # Forward through encoder only
+        v0 = self.down0(images)
+        v1 = self.down1(self.pool(v0))
+        v2 = self.down2(self.pool(v1))
+        v3 = self.down3(self.pool(v2))
+        v4 = self.down4(self.pool(v3))
+
+        # Global image vector
+        v_global = F.adaptive_avg_pool2d(v4, 1).flatten(1)  # [B, 8*base_ch]
+
         with torch.no_grad():
             _, sent_emb = self.lang_enc(texts, images.device)
-        v     = F.normalize(self.img_proj(v_global), dim=-1)
-        l     = F.normalize(self.text_proj(sent_emb), dim=-1)
+
+        v = F.normalize(self.img_proj(v_global), dim=-1)
+        l = F.normalize(self.text_proj(sent_emb), dim=-1)
         l_raw = F.normalize(sent_emb.detach().float(), dim=-1)
+        
         return v, l, l_raw

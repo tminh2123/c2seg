@@ -1,6 +1,6 @@
 project:
   name: c2seg
-  seed: 42
+  seed: 922               # ref uses 922
 
 data:
   train_dir: ../../dataset/QaTa-COV19/QaTa-COV19-v2/c2seg/train
@@ -12,8 +12,17 @@ data:
 model:
   in_channels: 3
   num_classes: 1
-  clip_model: "openai/clip-vit-base-patch32"
+  clip_model: "openai/clip-vit-base-patch32"  # ViT-B/32
   d_t: 512
+  max_token_len: 18       # ref uses 18
+  dropout: 0.5            # ref uses 0.5
+  drop_path_rate: 0.0
+
+# Masking for augmentation (ref config)
+masking:
+  text_mask_rate: 0.3
+  img_mask_rate: 0.3
+  mask_mode: "dist"       # Options: 'dist', 'random'
 
 # Stage I - CaCL pretraining
 pretrain:
@@ -27,13 +36,14 @@ pretrain:
 
 # Stage II - segmentation fine-tuning
 train:
-  epochs: 100
-  batch_size: 16
-  lr: 1.0e-3              # Paper: 1e-3 for QaTa-COV19 / CVC-ClinicDB
-  lr_slow: 3.0e-4         # Paper: 3e-4 for MosMedData+ / Kvasir
+  epochs: 500             # ref uses 500
+  batch_size: 32          # ref uses 32
+  lr: 3.0e-4              # ref uses 3e-4
   weight_decay: 1.0e-4
   grad_clip: 1.0
   bce_weight: 0.5
+  es_patience: 50         # early stopping patience
+  save_after: 50          # save best model after this epoch
 
 optimizer:
   name: adam
