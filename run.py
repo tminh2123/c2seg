@@ -359,6 +359,10 @@ if __name__ == '__main__':
     # Apply experiment tag to checkpoint and log paths
     if args.tag:
         tag = args.tag
+        # Append accum steps to tag if > 1
+        accum = getattr(args, 'accum_steps', 1)
+        if accum > 1:
+            tag = f"{tag}_accum{accum}"
         cfg['logging']['checkpoint_dir'] = f"checkpoints/{tag}"
         cfg['logging']['log_dir'] = f"logs/{tag}"
         cfg['pretrain']['checkpoint'] = f"checkpoints/{tag}/c2seg_pretrain.pth"
@@ -372,14 +376,49 @@ if __name__ == '__main__':
     channel_scale = cfg['model']['channel_scale']
     base_channels = [64, 128, 256, 512, 512]
     scaled_channels = [max(16, int(c * channel_scale)) for c in base_channels]
-    print(f"Channel scale: {channel_scale} -> {scaled_channels}")
+    
+    print("=" * 60)
+    print(f"Stage: {stage.upper()}")
+    print("=" * 60)
+    print(f"Config file: {args.config}")
+    if args.tag:
+        print(f"Experiment tag: {args.tag}")
+    print("-" * 60)
+    print("Model Config:")
+    print(f"  use_text: {cfg['model']['use_text']}")
+    print(f"  use_bcam: {cfg['model']['use_bcam']}")
+    print(f"  use_kan: {cfg['model']['use_kan']}")
+    print(f"  deep_supervision: {cfg['model']['deep_supervision']}")
+    print(f"  channel_scale: {channel_scale} -> {scaled_channels}")
+    print(f"  img_size: {cfg['model']['img_size']}")
+    print("-" * 60)
+    print("Data Config:")
+    print(f"  train_dir: {cfg['data']['train_dir']}")
+    print(f"  val_dir: {cfg['data']['val_dir']}")
+    print(f"  test_dir: {cfg['data']['test_dir']}")
+    print(f"  image_size: {cfg['data']['image_size']}")
+    print("-" * 60)
     
     if stage == 'pretrain':
-        print(f"Pretrain: epochs={cfg['pretrain']['epochs']}, batch_size={cfg['pretrain']['batch_size']}, lr={cfg['pretrain']['lr']}")
+        print("Pretrain Config:")
+        print(f"  epochs: {cfg['pretrain']['epochs']}")
+        print(f"  batch_size: {cfg['pretrain']['batch_size']}")
+        print(f"  lr: {cfg['pretrain']['lr']}")
+        print(f"  checkpoint: {cfg['pretrain']['checkpoint']}")
     elif stage == 'train':
-        print(f"Training: epochs={cfg['train']['epochs']}, lr={cfg['train']['lr']}, image_size={cfg['data']['image_size']}")
+        print("Train Config:")
+        print(f"  epochs: {cfg['train']['epochs']}")
+        print(f"  batch_size: {cfg['train']['batch_size']}")
+        print(f"  lr: {cfg['train']['lr']}")
+        print(f"  accum_steps: {cfg['accum_steps']}")
+        print(f"  effective_batch: {cfg['train']['batch_size'] * cfg['accum_steps']}")
+        print(f"  checkpoint_dir: {cfg['logging']['checkpoint_dir']}")
     elif stage == 'eval':
-        print(f"Evaluation: checkpoint={cfg['eval']['checkpoint']}, image_size={cfg['data']['image_size']}")
+        print("Eval Config:")
+        print(f"  checkpoint: {cfg['eval']['checkpoint']}")
+        print(f"  batch_size: {cfg['eval']['batch_size']}")
+        print(f"  threshold: {cfg['eval']['threshold']}")
+    print("=" * 60)
 
     if args.stage == 'pretrain':
         pretrain(cfg)
