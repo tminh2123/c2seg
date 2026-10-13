@@ -26,9 +26,9 @@ def save_checkpoint(state: dict, path: str):
     torch.save(state, path)
 
 
-def load_checkpoint(path: str, model, optimizer=None):
+def load_checkpoint(path: str, model, optimizer=None, strict=False):
     ckpt = torch.load(path, map_location='cpu')
-    model.load_state_dict(ckpt['model'])
+    model.load_state_dict(ckpt['model'], strict=strict)
     if optimizer and 'optimizer' in ckpt:
         optimizer.load_state_dict(ckpt['optimizer'])
     return ckpt.get('epoch', 0), ckpt.get('best_metric', 0.0)
