@@ -1,14 +1,15 @@
 """
 Training script for C2Seg.
 Usage:
-  # Stage I - CaCL pretraining
-  python run.py --stage pretrain --config configs/config.yaml
+  # QaTa-COV19 dataset
+  python run.py --stage pretrain --config configs/qata.yaml --tag qata_nokan --no-kan
+  python run.py --stage train --config configs/qata.yaml --tag qata_nokan --no-kan
+  python run.py --stage eval --config configs/qata.yaml --tag qata_nokan --no-kan
 
-  # Stage II - segmentation fine-tuning
-  python run.py --stage train --config configs/config.yaml
-
-  # Evaluation
-  python run.py --stage eval --config configs/config.yaml
+  # MosMedData+ dataset
+  python run.py --stage pretrain --config configs/mosmed.yaml --tag mosmed_nokan --no-kan
+  python run.py --stage train --config configs/mosmed.yaml --tag mosmed_nokan --no-kan
+  python run.py --stage eval --config configs/mosmed.yaml --tag mosmed_nokan --no-kan
 """
 
 import argparse
@@ -24,7 +25,7 @@ from utils.logger import get_logger
 from utils.metrics import AverageMeter
 from utils.seg_metrics import dice_score, miou_score, hd95, assd
 from models.c2seg import C2Seg
-from models.losses import CaCLLoss, BCEDiceLoss
+from models.losses import CaCLLoss, BCEDiceLoss, DeepSupervisionLoss
 from datasets.dataset import C2SegDataset
 
 
@@ -151,7 +152,13 @@ def train(cfg, pretrained_ckpt: str = None):
         load_checkpoint(ckpt, model)
         logger.info(f"Loaded pretrained weights from {ckpt}")
 
-    criterion = BCEDiceLoss(bce_weight=tcfg['bce_weight'])
+    # Use deep supervision loss if enabled
+    deep_sup = cfg['model'].get('deep_supervision', False)
+    if deep_sup:
+        criterion = DeepSupervisionLoss(bce_weight=tcfg['bce_weight'])
+        logger.info("Using Deep Supervision Loss")
+    else:
+        criterion = BCEDiceLoss(bce_weight=tcfg['bce_weight'])
 
     # visual encoder uses smaller lr (fine-tune), rest uses full lr
     # Visual encoder includes: down0-down4, pool
@@ -177,24 +184,43 @@ def train(cfg, pretrained_ckpt: str = None):
     ckpt_dir = Path(cfg['logging']['checkpoint_dir'])
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     best_dice = 0.0
+    
+    # Gradient accumulation
+    accum_steps = cfg.get('accum_steps', 1)
+    if accum_steps > 1:
+        logger.info(f"Gradient accumulation: {accum_steps} steps (effective batch = {tcfg['batch_size'] * accum_steps})")
 
     for epoch in range(tcfg['epochs']):
         model.train()
         loss_meter = AverageMeter()
+        optimizer.zero_grad()
 
-        for images, masks, texts in train_loader:
+        for batch_idx, (images, masks, texts) in enumerate(train_loader):
             images = images.to(device)
             masks  = masks.to(device)
 
-            logits = model(images, texts)
-            loss   = criterion(logits, masks)
-
-            optimizer.zero_grad()
+            outputs = model(images, texts)
+            
+            # Handle deep supervision output (tuple) vs single output
+            if isinstance(outputs, tuple):
+                loss = criterion(outputs, masks)
+                logits = outputs[0]  # main output for logging
+            else:
+                loss = criterion(outputs, masks)
+                logits = outputs
+            
+            # Scale loss for gradient accumulation
+            loss = loss / accum_steps
             loss.backward()
-            if tcfg.get('grad_clip'):
-                torch.nn.utils.clip_grad_norm_(model.parameters(), tcfg['grad_clip'])
-            optimizer.step()
-            loss_meter.update(loss.item(), images.size(0))
+            
+            # Update weights every accum_steps
+            if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(train_loader):
+                if tcfg.get('grad_clip'):
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), tcfg['grad_clip'])
+                optimizer.step()
+                optimizer.zero_grad()
+            
+            loss_meter.update(loss.item() * accum_steps, images.size(0))
 
         scheduler.step()
 
@@ -233,7 +259,11 @@ def evaluate(model, loader, device, threshold=0.5):
         for images, masks, texts in loader:
             images = images.to(device)
             masks  = masks.to(device)
-            logits = model(images, texts)
+            outputs = model(images, texts)
+            
+            # Handle deep supervision output (tuple) vs single output
+            logits = outputs[0] if isinstance(outputs, tuple) else outputs
+            
             B = images.size(0)
             dice_m.update(dice_score(logits, masks, threshold), 1)
             miou_m.update(miou_score(logits, masks, threshold), 1)
@@ -269,18 +299,20 @@ def eval_mode(cfg):
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--stage',  required=True, choices=['pretrain', 'train', 'eval'])
-    p.add_argument('--config', default='configs/config.yaml')
+    p.add_argument('--config', default='configs/qata.yaml')
     p.add_argument('--pretrained', default=None, help='Path to pretrained ckpt for stage II')
     p.add_argument('--no-text', action='store_true', help='Disable text fusion (ablation study)')
     p.add_argument('--no-bcam', action='store_true', help='Disable BCAM (ablation study)')
     p.add_argument('--no-kgate', action='store_true', help='Disable K-Gate (ablation study)')
     p.add_argument('--no-kan', action='store_true', help='Use MLP instead of KAN (ablation study)')
+    p.add_argument('--deep-sup', action='store_true', help='Enable deep supervision')
     p.add_argument('--epochs', type=int, default=None, help='Override number of epochs')
     p.add_argument('--lr', type=float, default=None, help='Override learning rate')
     p.add_argument('--image-size', type=int, default=None, help='Override image size')
     p.add_argument('--batch-size', type=int, default=None, help='Override batch size')
     p.add_argument('--tag', type=str, default=None, help='Experiment tag for checkpoint naming (e.g., "v1", "simple_kan")')
     p.add_argument('--channel-scale', type=float, default=1.0, help='Channel width scale (0.5=half, 0.25=quarter)')
+    p.add_argument('--accum-steps', type=int, default=1, help='Gradient accumulation steps (effective_batch = batch_size * accum_steps)')
     return p.parse_args()
 
 
@@ -293,6 +325,7 @@ if __name__ == '__main__':
     cfg['model']['use_bcam'] = not getattr(args, 'no_bcam', False)
     cfg['model']['use_kgate'] = not getattr(args, 'no_kgate', False)
     cfg['model']['use_kan'] = not getattr(args, 'no_kan', False)
+    cfg['model']['deep_supervision'] = getattr(args, 'deep_sup', False)
     
     # Apply channel scaling (use base_channel instead)
     base_channel = 64
@@ -320,6 +353,9 @@ if __name__ == '__main__':
         cfg['train']['batch_size'] = args.batch_size
         cfg['pretrain']['batch_size'] = args.batch_size
     
+    # Gradient accumulation
+    cfg['accum_steps'] = getattr(args, 'accum_steps', 1)
+    
     # Apply experiment tag to checkpoint and log paths
     if args.tag:
         tag = args.tag
@@ -341,7 +377,6 @@ if __name__ == '__main__':
     if stage == 'pretrain':
         print(f"Pretrain: epochs={cfg['pretrain']['epochs']}, batch_size={cfg['pretrain']['batch_size']}, lr={cfg['pretrain']['lr']}")
     elif stage == 'train':
-        print(f"Ablation: use_text={cfg['model']['use_text']}, use_bcam={cfg['model']['use_bcam']}, use_kgate={cfg['model']['use_kgate']}")
         print(f"Training: epochs={cfg['train']['epochs']}, lr={cfg['train']['lr']}, image_size={cfg['data']['image_size']}")
     elif stage == 'eval':
         print(f"Evaluation: checkpoint={cfg['eval']['checkpoint']}, image_size={cfg['data']['image_size']}")
