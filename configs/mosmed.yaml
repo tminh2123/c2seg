@@ -1,0 +1,62 @@
+project:
+  name: c2seg_mosmed
+  seed: 922               # ref uses 922
+
+data:
+  train_dir: ../../dataset/MosMedDataPlus/Train_Folder
+  val_dir:   ../../dataset/MosMedDataPlus/Val_Folder
+  test_dir:  ../../dataset/MosMedDataPlus/Test_Folder
+  image_size: 224
+  num_workers: 4
+
+model:
+  in_channels: 3
+  num_classes: 1
+  clip_model: "openai/clip-vit-base-patch32"  # ViT-B/32
+  d_t: 512
+  max_token_len: 18       # ref uses 18
+  dropout: 0.5            # ref uses 0.5
+  drop_path_rate: 0.0
+
+# Masking for augmentation (ref config)
+masking:
+  text_mask_rate: 0.3
+  img_mask_rate: 0.3
+  mask_mode: "dist"       # Options: 'dist', 'random'
+
+# Stage I - CaCL pretraining
+pretrain:
+  epochs: 50
+  batch_size: 256         # paper uses 256, reduce if OOM
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  temperature: 0.07       # tau
+  eps: 0.8                # soft-label mixing weight (rho)
+  checkpoint: checkpoints/mosmed_pretrain.pth
+
+# Stage II - segmentation fine-tuning
+train:
+  epochs: 500             # ref uses 500
+  batch_size: 32          # ref uses 32
+  lr: 3.0e-4              # ref uses 3e-4
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  bce_weight: 0.5
+  es_patience: 50         # early stopping patience
+  save_after: 50          # save best model after this epoch
+
+optimizer:
+  name: adam
+
+scheduler:
+  name: cosine
+
+eval:
+  batch_size: 32
+  threshold: 0.5
+  checkpoint: checkpoints/mosmed_best.pth
+
+logging:
+  log_dir: logs/
+  checkpoint_dir: checkpoints/
+  save_every: 10
