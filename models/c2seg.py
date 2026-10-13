@@ -254,15 +254,18 @@ class BCAModule(nn.Module):
         attn_l2v = F.softmax(sim_map.transpose(-1, -2), dim=-1)             # [B, H, N, HW]
 
         # Cross attention
+        # v_out: vision attended by language
         v_out = torch.matmul(attn_v2l, l_value)                             # [B, H, HW, D]
         v_out = v_out.permute(0, 2, 1, 3).reshape(b, hw, c)                 # [B, HW, C]
         a_v = self.gate_v(v_out).permute(0, 2, 1)                           # [B, C, HW]
 
-        l_out = torch.matmul(attn_l2v, v_value)                             # [B, H, N, D]
-        l_out = l_out.permute(0, 2, 1, 3).reshape(b, n_t, c)                # [B, N, C]
-        # Broadcast l_out to spatial: average over text tokens
-        l_out_spatial = l_out.mean(dim=1, keepdim=True).expand(-1, hw, -1)  # [B, HW, C]
-        a_l = self.gate_l(l_out_spatial).permute(0, 2, 1)                   # [B, C, HW]
+        # l_out: language attended by vision (following ref/c2seg exactly)
+        # einsum "b h i j, b h j k -> b h j k":
+        # attn_l2v[B,H,N,HW] * v_value[B,H,HW,D] -> [B,H,HW,D]
+        # This sums attention weights over N text tokens for each spatial position
+        l_out = torch.einsum("b h i j, b h j k -> b h j k", attn_l2v, v_value)  # [B, H, HW, D]
+        l_out = l_out.permute(0, 2, 1, 3).reshape(b, hw, c)                     # [B, HW, C]
+        a_l = self.gate_l(l_out).permute(0, 2, 1)                               # [B, C, HW]
 
         # Fuse and project
         fused = self.project(img_flat + a_v * a_l).view(b, c, h, w)
