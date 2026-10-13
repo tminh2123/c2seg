@@ -260,10 +260,10 @@ class BCAModule(nn.Module):
         a_v = self.gate_v(v_out).permute(0, 2, 1)                           # [B, C, HW]
 
         # l_out: language attended by vision (following ref/c2seg exactly)
-        # einsum "b h i j, b h j k -> b h j k":
-        # attn_l2v[B,H,N,HW] * v_value[B,H,HW,D] -> [B,H,HW,D]
-        # This sums attention weights over N text tokens for each spatial position
-        l_out = torch.einsum("b h i j, b h j k -> b h j k", attn_l2v, v_value)  # [B, H, HW, D]
+        # einsum "b h i j, b h j k -> b h j k" equivalent but memory-efficient:
+        # = v_value * sum(attn_l2v over N text tokens)
+        attn_sum = attn_l2v.sum(dim=2, keepdim=True)                            # [B, H, 1, HW]
+        l_out = v_value * attn_sum.transpose(-1, -2)                            # [B, H, HW, D]
         l_out = l_out.permute(0, 2, 1, 3).reshape(b, hw, c)                     # [B, HW, C]
         a_l = self.gate_l(l_out).permute(0, 2, 1)                               # [B, C, HW]
 
