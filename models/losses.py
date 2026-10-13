@@ -2,6 +2,7 @@
 Losses for C2Seg:
   - CaCLLoss: Cluster-aware Contrastive Learning loss (Stage I)
   - BCEDiceLoss: segmentation loss (Stage II)
+  - DeepSupervisionLoss: multi-scale loss with deep supervision
 """
 
 import torch
@@ -88,3 +89,44 @@ class BCEDiceLoss(nn.Module):
         dice_loss = dice_loss.mean()
 
         return self.bce_w * bce_loss + (1 - self.bce_w) * dice_loss
+
+
+class DeepSupervisionLoss(nn.Module):
+    """
+    Multi-scale deep supervision loss.
+    Computes BCEDiceLoss at multiple decoder scales with different weights.
+    
+    Ref/c2seg uses weights: [0.5, 0.2, 0.15, 0.1, 0.05] for 5 scales
+    """
+
+    def __init__(self, bce_weight: float = 0.5, weights: list = None):
+        super().__init__()
+        self.base_loss = BCEDiceLoss(bce_weight)
+        # Default weights from ref/c2seg config
+        self.weights = weights or [0.5, 0.2, 0.15, 0.1, 0.05]
+
+    def forward(self, outputs: tuple, targets: torch.Tensor):
+        """
+        outputs: tuple of (out0, out1, out2, out3, out4) at different scales
+                 out0: [B, 1, H, W]     - full resolution
+                 out1: [B, 1, H/2, W/2]
+                 out2: [B, 1, H/4, W/4]
+                 out3: [B, 1, H/8, W/8]
+                 out4: [B, 1, H/16, W/16]
+        targets: [B, 1, H, W] binary mask at full resolution
+        """
+        total_loss = 0.0
+        
+        for i, (out, weight) in enumerate(zip(outputs, self.weights)):
+            # Resize target to match output scale
+            if out.shape[2:] != targets.shape[2:]:
+                target_scaled = F.interpolate(
+                    targets, size=out.shape[2:], mode='nearest'
+                )
+            else:
+                target_scaled = targets
+            
+            loss = self.base_loss(out, target_scaled)
+            total_loss += weight * loss
+        
+        return total_loss
